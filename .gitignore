@@ -1,4 +1,4 @@
 .env
-credentials.json
+*.sqlite3
 
 .idea
