@@ -1,7 +1,8 @@
+import json
 import os
 from datetime import date
 import textwrap
-from typing import Literal
+from typing import Literal, Self
 from dataclasses import dataclass
 import sqlite3
 import logging
@@ -12,6 +13,7 @@ from mistralai import Mistral
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 def load_dotenv():
     try:
@@ -45,19 +47,31 @@ class Message:
     message: str
 
     @classmethod
-    def from_message(cls, message: str):
-        return cls(id=None, added_at=date.today(), message=message)
+    def from_db(cls, row: sqlite3.Row) -> Self:
+        """Create Message instance from SQLite Row"""
+        return cls(
+            id=row["id"],
+            added_at=date.fromisoformat(row["added_at"]),
+            message=row["message"],
+        )
+
+    def to_db(self) -> tuple:
+        """Convert Message instance to tuple for DB insertion (excluding id)"""
+        return (self.added_at.isoformat(), self.message)
 
     @classmethod
-    def from_db(cls, row: sqlite3.Row):
-        return cls(id=row[0], added_at=date.fromisoformat(row[1]), message=row[2])
-
-    def to_db(self) -> tuple[str, str]:
-        # exclude id because DB generates it
-        return (self.added_at.isoformat(), self.message)
+    def from_message(cls, message: str) -> Self:
+        return cls(
+            id=None,
+            added_at=date.today(),
+            message=message,
+        )
 
     def __str__(self):
         return f"Message {self.id} ({self.added_at}):\n{self.message}"
+
+
+type TaskStatus = Literal["pending", "running", "completed", "failed"]
 
 
 @dataclass
@@ -68,12 +82,12 @@ class Task:
     scheduled_for: date | None
     scheduled_for_comment: str | None
     description: str
-    status: Literal["pending", "running", "completed", "failed"]
+    status: TaskStatus
     comment: str
     from_message: int | None = None
 
     @classmethod
-    def from_description(cls, description: str, from_message: int | None = None):
+    def from_description(cls, description: str, from_message: int | None = None) -> Self:
         return cls(
             id=None,
             added_at=date.today(),
@@ -87,21 +101,45 @@ class Task:
         )
 
     @classmethod
-    def from_db(cls, row: sqlite3.Row):
+    def from_llm_tool_call(cls, properties: dict[str, str]) -> Self:
+        if not properties.get("description"):
+            raise ValueError("description must be provided")
+        if not properties.get("status"):
+            raise ValueError("status must be provided")
+        if properties["status"] not in ["pending", "running", "completed", "failed"]:
+            raise ValueError("status must be one of pending, running, completed, failed")
+
+        scheduled_for = date.fromisoformat(properties["scheduled_for"]) if properties.get("scheduled_for") else None
+        scheduled_for_comment = properties["scheduled_for_comment"] if properties.get("scheduled_for_comment") else None
         return cls(
-            id=row[0],
-            added_at=date.fromisoformat(row[1]),
-            last_modified_at=date.fromisoformat(row[2]),
-            scheduled_for=date.fromisoformat(row[3]) if row[3] else None,
-            scheduled_for_comment=row[4],
-            description=row[5],
-            status=row[6],
-            comment=row[7],
-            from_message=row[8],
+            id=None,
+            added_at=date.today(),
+            last_modified_at=date.today(),
+            scheduled_for=scheduled_for,
+            scheduled_for_comment=scheduled_for_comment,
+            description=properties["description"],
+            status=properties["status"],
+            comment=properties.get("comment", ""),
+            from_message=None,
+        )
+
+    @classmethod
+    def from_db(cls, row: sqlite3.Row) -> Self:
+        """Create Task instance from SQLite Row"""
+        return cls(
+            id=row["id"],
+            added_at=date.fromisoformat(row["added_at"]),
+            last_modified_at=date.fromisoformat(row["last_modified_at"]),
+            scheduled_for=date.fromisoformat(row["scheduled_for"]) if row["scheduled_for"] else None,
+            scheduled_for_comment=row["scheduled_for_comment"],
+            description=row["description"],
+            status=row["status"],
+            comment=row["comment"],
+            from_message=row["from_message"],
         )
 
     def to_db(self) -> tuple[str, str | None, str, str, str, str, str, int | None]:
-        # exclude id because DB generates it
+        """Convert Task instance to tuple for DB insertion (excluding id)"""
         return (
             self.added_at.isoformat(),
             self.last_modified_at.isoformat(),
@@ -127,16 +165,22 @@ class Task:
         """)
 
 
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(MESSAGE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def create_tables(cur: sqlite3.Cursor):
     logger.info("Creating tables if they don't exist")
     cur.execute("PRAGMA foreign_keys = ON;")  # Enable foreign keys
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            added_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-            message     TEXT
+        CREATE TABLE IF NOT EXISTS messages
+        (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            added_at TEXT,
+            message  TEXT
         )
         """
     )
@@ -207,13 +251,113 @@ def get_task_by_id(cur: sqlite3.Cursor, task_id: int) -> Task | None:
         return None
     return Task.from_db(row)
 
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_task",
+            "description": "Insert a new task into the database",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A concise description of the task."
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": (
+                            "An optional comment from about how the task seems "
+                            "to be going, if he is interested and everything "
+                            "else that did not fit in the other fields. It "
+                            "will be passed to you the next time you ask for "
+                            "this function."
+                        )
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "running", "completed", "failed"],
+                        "description": (
+                            "The status of the task. Only use the ones "
+                            "listed. Don't use percentages or any other "
+                            "measure. If you need to supply additional "
+                            "information, use the comment field."
+                        )
+                    },
+                    "scheduled_for": {
+                        "type": "string",
+                        "format": "date",
+                        "description": (
+                            "The date when the task is scheduled to be "
+                            "completed."
+                        )
+                    },
+                    "scheduled_for_comment": {
+                        "type": "string",
+                        "description": (
+                            "An optional comment about the scheduled date. "
+                            "Use this when there is either no specific date, "
+                            "they talk about a range, or something else that "
+                            "is important."
+                        )
+                    }
+                },
+                "required": ["description", "status"]
+            }
+        }
+    }
+]
+
+def extract_tasks_from_message(mistral: Mistral, message: str) -> list[Task]:
+    """Extracts tasks from a message."""
+    # Define a prompt for extracting tasks from the message
+    prompt = (
+        "Extract multiple tasks from the message at the end of this prompt "
+        "and insert them into the database using the insert_task function.\n"
+        f"Message: {message}"
+    )
+    response = mistral.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        tools=tools,
+        tool_choice="any",
+        parallel_tool_calls=True,
+    )
+    tasks: list[Task] = []
+    for choice in response.choices:
+        if choice.finish_reason == "tool_calls":
+            for tool_call in choice.message.tool_calls:
+                if tool_call.function.name == "insert_task":
+                    logger.debug(f"Extracted task: {tool_call.function.arguments}")
+                    task_desc = json.loads(tool_call.function.arguments)
+                    try:
+                        task = Task.from_llm_tool_call(task_desc)
+                    except Exception as e:
+                        logger.exception(f"The task could not be parsed!", exc_info=e)
+                        continue
+                    tasks.append(task)
+                else:
+                    logger.warning(f"Unknown tool call: {tool_call.function.name}")
+        else:
+            logger.warning(f"Unexpected finish reason: {choice.finish_reason}, {choice=}")
+    return tasks
+
+
 
 def generate_and_insert_sample_data(mistral: Mistral, cur: sqlite3.Cursor):
     """Ask the Mistral model for a few examples and insert them into the database."""
     logger.info("Generating sample data and inserting it")
 
     # Define a prompt for generating a sample message containing multiple tasks
-    message_prompt = "Generate a message that includes multiple tasks at different stages of completion."
+    message_prompt = (
+        "Generate a message that includes multiple tasks at different stages "
+        f"of completion. Today's date is {date.today().isoformat()}."
+    )
 
     # Use the Mistral client to generate a sample message
     messages_response = mistral.chat.complete(
@@ -234,49 +378,15 @@ def generate_and_insert_sample_data(mistral: Mistral, cur: sqlite3.Cursor):
     message = Message.from_message(message_text)
     message_id = insert_message(cur, message)
 
-    # Define a prompt for extracting tasks from the message
-    task_prompt = f"Extract multiple tasks with their descriptions and statuses (one of pending, running, completed, failed) and provide them in the format of `<description> | <status>` from the message at the end of this prompt. Separate each task by a new line!\nMessage: {message_text}"
-
-    # Use the Mistral client to generate task descriptions and statuses
-    task_response = mistral.chat.complete(
-        model=MISTRAL_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": task_prompt
-            }
-        ],
-        max_tokens=150
-    )
-
-    # Parse the generated tasks
-    tasks_text = task_response.choices[0].message.content.strip()
-    tasks = tasks_text.split('\n')
-
-    # Insert each task into the database
-    for task_description in tasks:
-        # Assuming the task description includes status, you may need to parse it accordingly
-        # For simplicity, let's assume the task description is separated by a comma or similar delimiter
-        if '|' in task_description:
-            description, status = task_description.split('|', 1)
-        else:
-            description, status = task_description, "pending"  # Default status
-
-        # Create and insert a task based on the message
-        task = Task.from_description(
-            description=description.strip(),
-            from_message=message_id
-        )
-        task.status = status.strip()  # Update the task status
+    tasks = extract_tasks_from_message(mistral, message_text)
+    for task in tasks:
         insert_task(cur, task)
 
     logger.info("Sample data generation and insertion completed")
 
 
-def generate_mail_body(messages: list[Message]) -> str:
+def generate_mail_body(mistral: Mistral, cur: sqlite3.Cursor) -> str:
     """Generates the body of the email by querying the model."""
-    # TODO: implement this function
-    pass
 
 
 def main():
@@ -289,19 +399,19 @@ def main():
     postmark = PostmarkClient(server_token=POSTMARK_SERVER_API_TOKEN)
     mistral = Mistral(api_key=MISTRAL_API_KEY)
 
+    print(extract_tasks_from_message(mistral, "This is a test message. It does not contain any tasks."))
+
     logger.info(f"Connecting to SQLite database at {MESSAGE_DB_PATH}")
-    with sqlite3.connect(MESSAGE_DB_PATH) as conn:
+    with get_connection() as conn:
         cur = conn.cursor()
 
         if IS_DEV:
             cur.execute("DROP TABLE IF EXISTS messages;")
             cur.execute("DROP TABLE IF EXISTS tasks;")
         create_tables(cur)
-
-        generate_and_insert_sample_data(mistral, cur)
-
         conn.commit()
 
+        generate_and_insert_sample_data(mistral, cur)
 
 if __name__ == "__main__":
     main()
