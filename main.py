@@ -189,12 +189,12 @@ def create_tables(cur: sqlite3.Cursor):
         CREATE TABLE IF NOT EXISTS tasks
         (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-            added_at              TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_modified_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            added_at              TEXT,
+            last_modified_at      TEXT,
             scheduled_for         TEXT,
             scheduled_for_comment TEXT,
             description           TEXT,
-            status                TEXT DEFAULT 'pending',
+            status                TEXT,
             comment               TEXT,
             from_message          INTEGER,
             FOREIGN KEY (from_message) REFERENCES messages (id)
