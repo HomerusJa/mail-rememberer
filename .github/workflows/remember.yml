@@ -17,7 +17,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: 'uv.lock'
 
-
       - name: Install the dependencies
         run: uv sync --no-dev
 
@@ -27,4 +26,5 @@ jobs:
           POSTMARK_SERVER_API_TOKEN: ${{ secrets.POSTMARK_SERVER_API_TOKEN }}
           RECEIVER_MAIL: ${{ vars.RECEIVER_MAIL }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          MISTRAL_MODEL: ${{ mistral-large-latest }}
+          MISTRAL_MODEL: ${{ vars.MISTRAL_MODEL }}
+          MESSAGE_DB_PATH: "changeme"  # TODO: Database saving and retrieving using artifacts has not been set up yet
