@@ -11,6 +11,7 @@ from mistralai import Mistral
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 def load_dotenv():
     try:
@@ -207,6 +208,71 @@ def get_task_by_id(cur: sqlite3.Cursor, task_id: int) -> Task | None:
     return Task.from_db(row)
 
 
+def generate_and_insert_sample_data(mistral: Mistral, cur: sqlite3.Cursor):
+    """Ask the Mistral model for a few examples and insert them into the database."""
+    logger.info("Generating sample data and inserting it")
+
+    # Define a prompt for generating a sample message containing multiple tasks
+    message_prompt = "Generate a message that includes multiple tasks at different stages of completion."
+
+    # Use the Mistral client to generate a sample message
+    messages_response = mistral.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": message_prompt,
+            }
+        ],
+        max_tokens=150,
+    )
+
+    # Parse the generated message
+    message_text = messages_response.choices[0].message.content.strip()
+
+    # Create and insert the message
+    message = Message.from_message(message_text)
+    message_id = insert_message(cur, message)
+
+    # Define a prompt for extracting tasks from the message
+    task_prompt = f"Extract multiple tasks with their descriptions and statuses (one of pending, running, completed, failed) and provide them in the format of `<description> | <status>` from the message at the end of this prompt. Separate each task by a new line!\nMessage: {message_text}"
+
+    # Use the Mistral client to generate task descriptions and statuses
+    task_response = mistral.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": task_prompt
+            }
+        ],
+        max_tokens=150
+    )
+
+    # Parse the generated tasks
+    tasks_text = task_response.choices[0].message.content.strip()
+    tasks = tasks_text.split('\n')
+
+    # Insert each task into the database
+    for task_description in tasks:
+        # Assuming the task description includes status, you may need to parse it accordingly
+        # For simplicity, let's assume the task description is separated by a comma or similar delimiter
+        if '|' in task_description:
+            description, status = task_description.split('|', 1)
+        else:
+            description, status = task_description, "pending"  # Default status
+
+        # Create and insert a task based on the message
+        task = Task.from_description(
+            description=description.strip(),
+            from_message=message_id
+        )
+        task.status = status.strip()  # Update the task status
+        insert_task(cur, task)
+
+    logger.info("Sample data generation and insertion completed")
+
+
 def generate_mail_body(messages: list[Message]) -> str:
     """Generates the body of the email by querying the model."""
     # TODO: implement this function
@@ -232,16 +298,7 @@ def main():
             cur.execute("DROP TABLE IF EXISTS tasks;")
         create_tables(cur)
 
-        # Example usage: inserting a fake message
-        example_message = Message.from_message("Today I want to fix the car's brakes.")
-        insert_message(cur, example_message)
-
-        # Example usage: inserting a fake task based on the message
-        example_task = Task.from_description(
-            "Fix the car's brakes",
-            from_message=example_message.id,
-        )
-        insert_task(cur, example_task)
+        generate_and_insert_sample_data(mistral, cur)
 
         conn.commit()
 
