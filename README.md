@@ -78,6 +78,10 @@ This project is designed to be used with GitHub Actions. For that, the [`remembe
 
 Contributions are welcome! Please fork the repository and create a pull request with your changes. Notes on how to set everything up can be found in the [setup](#setup) section.
 
+If you have any questions, feel free to open an issue or a discussion; I don't really have a preference in that regard.
+
+Please **always** create an issue before starting to work on a pull request. This way, we can discuss the changes and make sure that they are appropriate for the project **before** you put in the time. When starting with open source, I made that error, so don't be like me (-: 
+
 ## 📄 License
 
 This project is licensed under the MIT License.
