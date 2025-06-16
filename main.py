@@ -30,21 +30,45 @@ def load_dotenv():
 
 load_dotenv()
 
+def _get_env_or_raise(name: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        raise ValueError(f"Environment variable {name} is not set")
+    return value
+
 IS_DEV: bool = os.getenv("ENV", "").lower() == "dev"
 
-RECEIVER_MAIL: str = os.getenv("RECEIVER_MAIL")
-POSTMARK_SERVER_API_TOKEN: str = os.getenv("POSTMARK_SERVER_API_TOKEN")
+RECEIVER_MAIL: str = _get_env_or_raise("RECEIVER_MAIL")
+POSTMARK_SERVER_API_TOKEN: str = _get_env_or_raise("POSTMARK_SERVER_API_TOKEN")
 
-MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY")
-MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL")
+MISTRAL_API_KEY: str = _get_env_or_raise("MISTRAL_API_KEY")
+MISTRAL_MODEL: str = _get_env_or_raise("MISTRAL_MODEL")
 
-MESSAGE_DB_PATH: str = os.getenv("MESSAGE_DB_PATH")
+MESSAGE_DB_PATH: str = _get_env_or_raise("MESSAGE_DB_PATH")
 
 @dataclass
-class Message:
-    id: int | None
+class BaseMessage:
     added_at: date
     message: str
+
+
+class Message(BaseMessage):
+    def to_db(self) -> tuple:
+        """Convert Message instance to tuple for DB insertion (excluding id)"""
+        return (self.added_at.isoformat(), self.message)
+
+    @classmethod
+    def from_message(cls, message: str) -> Self:
+        return cls(
+            added_at=date.today(),
+            message=message,
+        )
+
+
+
+@dataclass
+class DBMessage(BaseMessage):
+    id: int
 
     @classmethod
     def from_db(cls, row: sqlite3.Row) -> Self:
@@ -55,28 +79,20 @@ class Message:
             message=row["message"],
         )
 
-    def to_db(self) -> tuple:
-        """Convert Message instance to tuple for DB insertion (excluding id)"""
-        return (self.added_at.isoformat(), self.message)
-
     @classmethod
-    def from_message(cls, message: str) -> Self:
+    def from_message(cls, message: Message, id: int) -> Self:
         return cls(
-            id=None,
-            added_at=date.today(),
-            message=message,
+            id=id,
+            added_at=message.added_at,
+            message=message.message,
         )
-
-    def __str__(self):
-        return f"Message {self.id} ({self.added_at}):\n{self.message}"
 
 
 type TaskStatus = Literal["pending", "running", "completed", "failed"]
 
 
 @dataclass
-class Task:
-    id: int | None
+class BaseTask:
     added_at: date
     last_modified_at: date
     scheduled_for: date | None
@@ -84,12 +100,53 @@ class Task:
     description: str
     status: TaskStatus
     comment: str
-    from_message: int | None = None
+    from_message: int | None
+
+@dataclass
+class Task(BaseTask):
+    def to_db(
+        self,
+    ) -> tuple[str, str, str | None, str | None, str, str, str, int | None]:
+        """Convert Task instance to tuple for DB insertion"""
+        return (
+            self.added_at.isoformat(),
+            self.last_modified_at.isoformat(),
+            self.scheduled_for.isoformat() if self.scheduled_for else None,
+            self.scheduled_for_comment,
+            self.description,
+            str(self.status),
+            self.comment,
+            self.from_message,
+        )
 
     @classmethod
-    def from_description(cls, description: str, from_message: int | None = None) -> Self:
+    def from_llm_tool_call(cls, properties: dict[str, str]) -> Self:
+        scheduled_for = (
+            date.fromisoformat(properties["scheduled_for"])
+            if properties.get("scheduled_for")
+            else None
+        )
+        scheduled_for_comment = (
+            properties["scheduled_for_comment"]
+            if properties.get("scheduled_for_comment")
+            else None
+        )
         return cls(
-            id=None,
+            added_at=date.today(),
+            last_modified_at=date.today(),
+            scheduled_for=scheduled_for,
+            scheduled_for_comment=scheduled_for_comment,
+            description=properties["description"],
+            status=properties["status"],  # type: ignore
+            comment=properties.get("comment", ""),
+            from_message=None,
+        )
+
+    @classmethod
+    def from_description(
+        cls, description: str, from_message: int | None = None
+    ) -> Self:
+        return cls(
             added_at=date.today(),
             last_modified_at=date.today(),
             scheduled_for=None,
@@ -100,28 +157,10 @@ class Task:
             from_message=from_message,
         )
 
-    @classmethod
-    def from_llm_tool_call(cls, properties: dict[str, str]) -> Self:
-        if not properties.get("description"):
-            raise ValueError("description must be provided")
-        if not properties.get("status"):
-            raise ValueError("status must be provided")
-        if properties["status"] not in ["pending", "running", "completed", "failed"]:
-            raise ValueError("status must be one of pending, running, completed, failed")
 
-        scheduled_for = date.fromisoformat(properties["scheduled_for"]) if properties.get("scheduled_for") else None
-        scheduled_for_comment = properties["scheduled_for_comment"] if properties.get("scheduled_for_comment") else None
-        return cls(
-            id=None,
-            added_at=date.today(),
-            last_modified_at=date.today(),
-            scheduled_for=scheduled_for,
-            scheduled_for_comment=scheduled_for_comment,
-            description=properties["description"],
-            status=properties["status"],
-            comment=properties.get("comment", ""),
-            from_message=None,
-        )
+@dataclass
+class DBTask(BaseTask):
+    id: int
 
     @classmethod
     def from_db(cls, row: sqlite3.Row) -> Self:
@@ -130,7 +169,9 @@ class Task:
             id=row["id"],
             added_at=date.fromisoformat(row["added_at"]),
             last_modified_at=date.fromisoformat(row["last_modified_at"]),
-            scheduled_for=date.fromisoformat(row["scheduled_for"]) if row["scheduled_for"] else None,
+            scheduled_for=date.fromisoformat(row["scheduled_for"])
+            if row["scheduled_for"]
+            else None,
             scheduled_for_comment=row["scheduled_for_comment"],
             description=row["description"],
             status=row["status"],
@@ -138,31 +179,19 @@ class Task:
             from_message=row["from_message"],
         )
 
-    def to_db(self) -> tuple[str, str | None, str, str, str, str, str, int | None]:
-        """Convert Task instance to tuple for DB insertion (excluding id)"""
-        return (
-            self.added_at.isoformat(),
-            self.last_modified_at.isoformat(),
-            self.scheduled_for.isoformat() if self.scheduled_for else None,
-            self.scheduled_for_comment,
-            self.description,
-            self.status,
-            self.comment,
-            self.from_message,
+    @classmethod
+    def from_task(cls, task: Task, id: int) -> Self:
+        return cls(
+            id=id,
+            added_at=task.added_at,
+            last_modified_at=task.last_modified_at,
+            scheduled_for=task.scheduled_for,
+            scheduled_for_comment=task.scheduled_for_comment,
+            description=task.description,
+            status=task.status,
+            comment=task.comment,
+            from_message=task.from_message,
         )
-
-    def __str__(self):
-        scheduled_for_str = self.scheduled_for.isoformat() if self.scheduled_for else "None"
-        scheduled_for_comment_str = self.scheduled_for_comment or "None"
-        return textwrap.dedent(f"""
-            Task {self.id} ({self.added_at.isoformat()}):
-            {self.description}
-            Status: {self.status}
-            Comment: {self.comment}
-            Last modified at: {self.last_modified_at.isoformat()}
-            Scheduled for: {scheduled_for_str}
-            Scheduled for comment: {scheduled_for_comment_str}
-        """)
 
 
 def get_connection() -> sqlite3.Connection:
@@ -203,24 +232,18 @@ def create_tables(cur: sqlite3.Cursor):
     )
 
 
-def insert_message(cur: sqlite3.Cursor, message: Message) -> int:
-    if message.id is not None:
-        raise ValueError("Message.id should be None when inserting a new message")
-
+def insert_message(cur: sqlite3.Cursor, message: Message) -> DBMessage:
     logger.debug(f"Inserting message {message!r}")
     cur.execute(
         "INSERT INTO messages (added_at, message) VALUES (?, ?)",
         message.to_db(),
     )
     message_id = cur.lastrowid
-    message.id = message_id  # also updates instance outside of this scope
-    return message_id
+    assert message_id is not None, "Never happens as we just inserted a message"
+    return DBMessage.from_message(message, message_id)
 
 
-def insert_task(cur: sqlite3.Cursor, task: Task) -> int:
-    if task.id is not None:
-        raise ValueError("Task.id should be None when inserting a new task")
-
+def insert_task(cur: sqlite3.Cursor, task: Task) -> DBTask:
     logger.debug(f"Inserting task {task!r}")
     cur.execute(
         """
@@ -232,24 +255,20 @@ def insert_task(cur: sqlite3.Cursor, task: Task) -> int:
         task.to_db(),
     )
     task_id = cur.lastrowid
-    task.id = task_id  # also updates instance outside of this scope
-    return task_id
+    assert task_id is not None, "Never happens as we just inserted a task."
+    return DBTask.from_task(task, task_id)
 
 
-def get_message_by_id(cur: sqlite3.Cursor, message_id: int) -> Message | None:
+def get_message_by_id(cur: sqlite3.Cursor, message_id: int) -> DBMessage | None:
     cur.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
     row = cur.fetchone()
-    if row is None:
-        return None
-    return Message.from_db(row)
+    return None if row is None else DBMessage.from_db(row)
 
 
-def get_task_by_id(cur: sqlite3.Cursor, task_id: int) -> Task | None:
+def get_task_by_id(cur: sqlite3.Cursor, task_id: int) -> DBTask | None:
     cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
     row = cur.fetchone()
-    if row is None:
-        return None
-    return Task.from_db(row)
+    return None if row is None else DBTask.from_db(row)
 
 tools = [
     {
@@ -387,6 +406,7 @@ def generate_and_insert_sample_data(mistral: Mistral, cur: sqlite3.Cursor):
 
 def generate_mail_body(mistral: Mistral, cur: sqlite3.Cursor) -> str:
     """Generates the body of the email by querying the model."""
+    return NotImplemented
 
 
 def main():
